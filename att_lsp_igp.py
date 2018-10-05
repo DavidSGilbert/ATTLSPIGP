@@ -1,9 +1,7 @@
 #!/usr/local/bin/python3
 import logging
 import socket
-from itertools import chain
-# from typing import List
-
+import re
 from nfdk.model_v2.simple_model_pojo_pool import SimpleModelPojoPool
 from nfdk.plugin.output_formaters import textual_output, tabular_output
 from nfdk.plugin.plugin_base import PluginBase, PluginType
@@ -20,7 +18,7 @@ class LspIgpPath(PluginBase):
     """
     GUID = "LspIgpPath"
     NAME = "LSP IGP Paths"
-    VERSION = "1.00"
+    VERSION = "1.10"
     PLUGIN_TYPE = PluginType.REPORT
     DESCRIPTION = "Present the IGP path of an LSP"
     PARAMS_SCHEMA = {
@@ -65,33 +63,45 @@ class LspIgpPath(PluginBase):
         if num_matched_routers == 0:
             return textual_output("Router not found. Identifier: {}".format(self._router_id))
         router = matched_routers[0]
-
-        link_lists = [await self.brain_rest_connector.get_links(LinkLayerEnum.LSP, root=router.guid)]
-        router_lsps = [link for link in chain(*link_lists)]
-        matched_lsp = [x for x in router_lsps if self._lsp_name.lower() in x.guid.lower()]
+        router_lsps = [await self.brain_rest_connector.get_links(LinkLayerEnum.LSP, root=router.guid)]  # REVIEW (evgeny): 'router_lsps' and 'link_lists[0]' are same.
+        # (davidg): Fixed. Using list index[0]
+        matched_lsp = [x for x in router_lsps[0] if self._lsp_name.lower() in x.guid.lower()]
         num_matched_lsps = len(matched_lsp)
         if num_matched_lsps == 0:
             return textual_output("LSP not found. Identifier: {}".format(self._lsp_name))
-        lsp = matched_lsp[0]
+        lsp = matched_lsp[0]  # REVIEW (evgeny): is it possible a few matches?  (davidg) Yes, if partial lsp_name from PARAMS_SCHEMA
 
         rows = []
         if lsp.paths:
-            lsp_path_guid = [x.guid for x in lsp.paths]
-            lsp_path = self._model.get_by_guid(lsp_path_guid[0])
+            lsp_path_guid = next(iter(lsp.paths)).guid  # REVIEW (evgeny): if you assume len(lsp.paths) is always == 1 so
+            # lsp_path_guid = next(iter(lsp.paths)).guid or list(lsp.paths)[0].guid (will get you guid of lsp path) (davidg): Fixed.
+            lsp_path = self._model.get_by_guid(lsp_path_guid)
             row = []
-            for path_hop in lsp_path.hops:
-                temp = path_hop.link_non_throwing.guid.split('/')
-                if path_hop.direction.name == "B_TO_A":
-                    row.append([temp[4], temp[5]])
-                    row.append([temp[2], temp[3]])
-                if path_hop.direction.name == "A_TO_B":
-                    row.append([temp[2], temp[3]])
-                    row.append([temp[4], temp[5]])
+            for path_hop in lsp_path.hops:  # REVIEW (evgeny): are you sure that path_hop.guid format will be consistent all the time?
+                                            # please, wrap 'for' loop content in try/except to prevent parsing errors that might will lead to report failure
+                                            # (davidg) extract IP addresses via regex instead of .split('/') and validate quantity (4)
+                hop_ips = re.findall(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', path_hop.link_non_throwing.guid)
+                try:
+                    assert len(hop_ips) == 4, "Missing IP In Hop"
+                    if path_hop.direction.name == "B_TO_A":
+                        row.append([hop_ips[2], hop_ips[3]])
+                        row.append([hop_ips[0], hop_ips[1]])
+                    if path_hop.direction.name == "A_TO_B":
+                        row.append([hop_ips[0], hop_ips[1]])
+                        row.append([hop_ips[2], hop_ips[3]])
+                except AssertionError as ex:
+                    row = [ex.args[0].split(' ')]
             for line in row:
                 igp_router = self._model.get_by_guid(f'IN/{line[0]}')
-                site = igp_router.site_non_throwing
-                rows.append([site.name, igp_router.name, line[0], line[1]])
-
+                try:  # REVIEW (evgeny): if router does not have a site assignment?
+                    #  please, check for None (otherwise in case of None report will fail during the run)
+                    # (davidg) check for site and indicate if missing
+                    assert igp_router.site_non_throwing, 'No site assigned'
+                    site = igp_router.site_non_throwing
+                    site_name = site.name
+                except AssertionError as ex:
+                    site_name = ex.args[0]
+                rows.append([site_name, igp_router.name, line[0], line[1]])
         rows.append([''])
         rows.append([f'Router {router.name} ({router.guid}) sees {len(router_lsps)} LSPs'])
         rows.append([f'LSP {lsp.name} ({lsp.guid})'])
